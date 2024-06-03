@@ -380,3 +380,85 @@ void func(std::size_t N)
 }
 ```
 * 如果能够保证程序中不会出现 `NaN` 和 `Inf`, 可以增加编译器参数 `-ffast-math`, 让 GCC 更加大胆地尝试浮点运算的优化, 有时能带来 2 倍左右的速度提升。
+
+## x86 SIMD 优化 [原文](https://www.cnblogs.com/moonzzz/p/17806496.html)
+* SIMD(Single Instruction, Multiple Data) 是一种并行计算技术, 通过向量寄存器存储多个数据元素, 并使用单条指令同时对这些数据元素进行处理, 从而提高计算效率。SIMD 其实是一种指令集的扩展, 如 `x86 平台的 SSE/AVX` 和 `ARM 平台的 NEON`。在 C++ 程序中使用 SIMD 指令的两种方式是 `内联汇编` 和 `intrinsic 函数`。`intrinsic 函数` 是对汇编指令的封装, 编译这些函数的时候会被内联成汇编, 不会产生函数调用的开销。完整的 `intrinsic 函数` 请查看 [文档](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html)。
+* x86 目前主要的 SIMD 指令集有 `MMX`, `SSE`, `AVX`, `AVX-512`, 其处理的数据位宽为 `64位`, `128位`, `256位`, `512位`。每种位宽都对应一个数据类型, 名称包含 3 个部分。前缀 `__m`, 中间是数据位宽, 如 `64`, `128`, `256`, `512`, 类型 `i` 表示整数(int), `d` 表示双精度浮点型(double), `什么都不加` 表示单精度浮点型。
+* `intrinsic 函数` 命名规则, 前缀 `_mm`(MMX 和 SSE 都以这个开头, AVX 和 AVX-512 会额外加上 `256` 和 `512` 位宽标识)。中间部分表示执行的操作 `_add` 和 `_mul`。最后一部分表示为操作选择的数据范围和浮点类型, `_ps` 表示矢量化对所有 `float` 运算, `_ss` 只对最低位的 `float` 运算, `_epixx` 表示操作所有的 xx 位的有符号整数, `_epuxx` 表示操作所有的 xx 位的无符号整数。
+
+### 内存对齐
+* 内存对齐就是`将数据存储在地址能够被特定大小(4,8,16)整除的内存地址上`, 现代计算机系统的硬件设计通常优化了对齐的内存访问, 对齐的数据可以让 CPU 更高效地读写内存。使用 `alignas(N)` 来指定变量或类型的最小对齐要求。对于 `malloc` 内存申请, 也有相应的设置方法。128 位宽的 SSE 要求 `16` 字节对齐, 而 256 位宽的 AVX 函数要求 `32` 字节对齐。内存对齐要求的字节数就是指令需要处理的字节数，而要求内存对齐也是为了能够一次访问就完整地读到数据，从而提升效率。
+```C++
+#include<stdlib.h>
+alignas(32) int arr[5];
+
+// 对 malloc 和 free, 内存对齐来使用
+float *B = (float *)aligned_alloc(32, sizeof(float) * SIZE); // <stdlib.h>
+free(B);                                              // 用于释放_aligned_malloc申请的内存
+```
+
+### Reduce 优化
+* 以下以 sum Reduce 举例, 整个过程分成 3 个部分
+    * 第一部分就是依据自己的处理器架构选择能够矢量化的位宽, 然后依据元素的个数, 先将够矢量化的部分进行矢量化运算(从数据导入矢量化寄存器, 运算得到结果)
+    * 将矢量化运算部分的结果导出到数组中, 然后对这些元素再进行规约(此时通常结构体比较简单, 可以直接进行循环展开)。
+    * 最后将不够矢量化的部分再进行规约, 这里结构体简单, 也可以进行循环展开。
+
+```C++
+#include <chrono>
+#include <iostream>
+#include <immintrin.h>
+#include <stdlib.h>
+
+// 每次读取 8 个整数, 但是为了防止不对齐的现象, 将最开始直接减少 8
+int reduce_sum_simd(int *array, int N)
+{
+    // 使用向量化的处理能够对齐的部分
+    __m256i result = _mm256_setzero_si256();
+    int i=0;
+    for(; i<=N-8; i+=8)
+    {
+        __m256i tmp = _mm256_loadu_si256((__m256i*)&array[i]);
+        result = _mm256_add_epi32(result, tmp);
+    }
+
+    // 将向量化的结果进行规约
+    int sum_vec[8];
+    int scalar_result = 0;
+    _mm256_storeu_si256((__m256i*)sum_vec, result);
+
+    #pragma GCC unroll 4  // 因为循环体内部结构简单, 所以进行循环展开
+    for(int j=0; j<8; ++j)
+    {
+        scalar_result+=sum_vec[j];
+    }
+
+    // 将剩余部分进行相加
+    #pragma GCC unroll 4
+    for(; i<N; ++i)
+    {
+        scalar_result+=array[i];
+    }
+
+    return scalar_result;
+}
+```
+### Element 优化
+* 逐元素的操作, 如果是对数组的连续读取, 一般不会有很高的加速比, 因为编译器也会对这种连续的操作进行矢量化。
+```C++
+void sumArraySimd(float* A, float* B, float* C, int N)
+{
+    // 先处理能够规约的部分
+    int i=0;
+    #pragma GCC unroll 4
+    for(; i<=N-8; i+=8)
+    {
+        _mm256_store_ps(C+i, _mm256_add_ps(_mm256_load_ps(A+i), _mm256_load_ps(B+i)));
+    }
+
+    for(; i<N; ++i)
+    {
+        C[i] = A[i] + B[i];
+    }
+}
+```
+### 矩阵乘法优化

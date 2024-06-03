@@ -1,4 +1,5 @@
 #include <iostream>
+#include <immintrin.h>
 using namespace std;
  
 struct struct_Test1
@@ -46,6 +47,6 @@ int main(int argc)
 	cout<<"test4 size:"<<sizeof(test4)<<endl;
  
 	system("pause");
- 
+
 	return 0;
 }
