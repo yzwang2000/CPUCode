@@ -381,6 +381,204 @@ void func(std::size_t N)
 ```
 * 如果能够保证程序中不会出现 `NaN` 和 `Inf`, 可以增加编译器参数 `-ffast-math`, 让 GCC 更加大胆地尝试浮点运算的优化, 有时能带来 2 倍左右的速度提升。
 
+## OpenMP 基础
+* OpemMP(Open Multi-Processing) 是一个用于并行编程的 API, 主要用于`共享内存的多处理器编程`。支持 `C++`, `Fortan` 语言。使用时要包含 `#include<omp.h>`, 并添加编译器参数 `-fopenmp`。
+### #pragma omp parallel
+* `#pragma omp parallel` 该构造将会 fork 一组线程, 执行构造内的代码, 完成之后将线程 join 在一起, 这样主线程继续执行。在创建线程组的时候, 会有一个特定的默认线程数。
+* 可以通过 `void omp_set_num_threads();` 改变默认的线程数, 在被新的值明确覆盖之前, 这个值默认被用作后续并行区域的线程请求数。但是注意一点, 即使程序员显示地要求了线程数, 系统也可能创建少于要求线程数的组。但是线程组一旦形成, 其规模就固定了。
+* 默认情况下, 在并行构造之前声明的变量在线程间是共享的, 而在并行构造内部声明的变量是线程的私有变量(不用命令修改的情况下是这样的)。
+```C++
+    // int omp_get_thread_num();   返回线程序号, 返回的值是线程组中的序号, 范围从 0 到 线程数-1
+    // int omp_get_num_threads();  返回当前线程组中线程总数
+
+    // 被每个线程执行的函数
+    void pooh(int ID, double *A)
+    {
+        A[ID] = ID;
+    }
+
+    int main(int argc, char **argv)
+    {
+        double A[10]{0}; // 数组属于所有线程
+
+        omp_set_num_threads(4);
+
+        int size_of_team{0};
+        #pragma omp parallel
+        {
+            int ID = omp_get_thread_num();             // 是每个线程的私有变量, 线程编号, 是一个从 0(主线程) 到 线程数-1 的数字
+            if (!ID)  // 线程 id 为 0 来获取呢
+                size_of_team = omp_get_num_threads();  // 想要知道一个线程组里有多少个线程, 因为不能假定请求的数就是所拥有的数
+            pooh(ID, A);
+            std::cout << "ID: " << ID << " A[ID]: " << A[ID] << std::endl;
+        } // 结束并行区域
+
+        std::cout << "总的请求到的线程数为 " << size_of_team << std::endl;
+        return 0;
+    }
+```
+### #pragma omp critical 和 #pragma omp barrier
+* 不同线程时并发执行的, 而且不同线程的指令不能按照固定顺序来执行。所以就需要同步线程, OpenMP 两种同步线程的方式 `临界区` 和 `栅栏`。
+* `#pragma omp critical` 该构造定义一个以相互排斥的方式执行的代码块, 即一次只有一个线程执行代码, 另外的线程有可能在构造的开始处等待, 直到轮到自己。
+```C++
+    // 设置步长的大小
+    constexpr int64_t num_steps = 1e8;
+    constexpr uint8_t kthreads = 64;
+    constexpr uint8_t kcblk = 60;
+
+    int main(int argc, char **argv)
+    {
+        // 并行程序求积分
+        double step{1. / num_steps}, start_time{0.}, end_time{0.};
+        double final_result{0.};
+
+        auto Func = [](double x) -> double
+        {
+            return 4.0 / (1 + x * x);
+        };
+
+        omp_set_num_threads(kthreads);
+        start_time = omp_get_wtime(); // 从过去的某一时刻, 返回以秒为单位的时间库例程
+
+        #pragma omp parallel
+        {
+            uint8_t ID = omp_get_thread_num();
+            double private_result{0.0};
+            double x{0.0};
+            for (uint64_t i = ID; i < num_steps; i += kthreads)
+            {
+                x = (i + 0.5) * step; // 注意这里不能写成累加的形式
+                private_result += Func(x) * step;
+            }
+
+            #pragma omp critical
+            {
+                final_result += private_result;
+            }
+        } // 结束并行区域
+
+        end_time = omp_get_wtime();
+
+        std::cout << "积分结果为: " << final_result << " 花费时间: " << (end_time - start_time) << std::endl;
+
+        return 0;
+    }
+```
+* `#pragma omp barrier` 定义了程序中的一个点, 在这个点上, 一个线程组中的所有线程都必须在任何线程跨过栅栏之前到达。这个指令可以在并行区域内的任何地方插入显示栅栏。
+
+### #pragma omp parallel for
+* SIMD 的模式通常会将数据分成多个块, 然后每个线程也就要相应的负责每个块的其实位置和终止位置。`#pragma omp parallel for` 的方式进行循环展开, 将总的迭代块均分给每个线程, 还能自行处理边界条件。`#pragma omp for` 构造末尾有一个隐式的栅栏, 这个栅栏能够通过 `nowait` 来去掉。
+* 测试循环迭代是否真正独立的一个有用的技术是 `通过交换起始条件和终止条件来反向执行循环`, 如果循环的反向遍历产生的结果与正向遍历相同, 那么这个循环很可能没有循环携带的依赖性(虽不能保证)。
+```C++
+    // #pragma omp parallel
+    // {
+    //     #pragma omp for
+    //     for(int i=0; i<N; i++){
+    //         a[i] = a[i] + b[i];
+    //     }
+    // }
+
+    // 或者
+
+    // #pragma omp parallel for
+    // for(int i=0; i<N; i++){
+    //     a[i] = a[i] + b[i];
+    // }
+```
+* 对于循环的迭代过程, OpenMP 会首先将第一个循环索引变量设置为私有变量(这个是默认的), 下面程序中的 `i`。然后会依据 `迭代步骤` 和 `范围` 确定每个线程所分配到的迭代空间。比如 `schedule(static, 3)` 每个迭代块的大小为 3。假如 4 个线程, 迭代范围是 0-7。那么 `线程0: 0, 1, 2  线程1: 3, 4, 5  线程2: 6, 7`。然后每个线程的 `i` 变量会在其分配的范围内进行迭代。这个迭代空间分配的过程, 也就是其比普通自己写的开销。`每个迭代步` 是属于一个空间的, 在这个空间中的私有变量出了这个迭代步就结束了。想要跨迭代步但属于同一个线程的变量得使用 reduction, 其声明的变量的值会在一个线程执行到最后一个迭代步之后被取出, 将所有线程的取出来的值与变量的原始值进行 `op`。
+* 让 omp 自动调度各个循环迭代的时候, 要保证每个迭代都是独立的。对于其中的规约操作, 就是每个在多个线程处理同一个共享变量时, 每个线程先生成共享变量的副本, 然后结束时所有线程的这个变量副本进行 `op`, 再与这个共享变量的原始值进行 `op`。`op` 的作用是初始化每个线程的规约变量值和在并行循环结束后, 将每个线程的本地副本合并成最终值。
+* 对于调度的问题, 分为`静态调度`和`动态调度`。静态调度适合每个迭代步骤时间差不多的, 动态调度适合每个迭代步骤时间差很多的。静态调度中 `schedule(static, 1)` 是周期调度, `schedule(static)` 是分块调度。动态调度和静态调度都可以指定任务的细粒度。但是静态调度那些任务分给那些线程是编译时就确定了, 而动态调度会随着程序运行, 自己进行切换。所以动态调度的消耗代价也更大。
+```C++
+    #pragma omp parallel for
+    for (int i = 0; i < aaa.size(); ++i)
+    {
+        final_result[i] = aaa[i];
+    }
+```
+```C++
+    int main(int argc, char **argv)
+    {
+
+        std::vector<int> aaa{1, 2, 3, 4, 5, 6, 7, 8};
+        int final_result{0};
+
+        omp_set_num_threads(4);
+        #pragma omp parallel for reduction(+ : final_result) schedule(static, 3)
+        for (int i = 0; i < aaa.size(); ++i)
+        {
+            final_result += aaa[i];
+        }
+
+        std::cout << "累加和的最终结果为: " << final_result << std::endl;
+
+        return 0;
+    }
+```
+```C++
+    // 对于第一种情况 k 是共享变量, k 会有竞争, 这种写法是不对的
+    double k = 2.0f;
+    omp_set_num_threads(3);
+    #pragma omp parallel
+    {
+        int ID = omp_get_thread_num();
+        #pragma omp for schedule(static, 2)
+        for(int i=0; i<10; ++i){
+            k += 2;
+            #pragma omp critical
+            {
+                std::cout <<"ID: " << ID << " k: " << k << std::endl;
+            }
+        }
+    }
+    std::cout << "k: " << k << std::endl;
+
+
+    // 对于第二种情况, 每个线程都会初始一个私有变量 k, 这个变量是真的属于每个线程跨循环迭代的
+    // + 只是决定了初始化的值 和 最后各个线程的值与共享变量如何操作
+    double k = 2.0f;
+    omp_set_num_threads(3);
+    #pragma omp parallel
+    {
+        int ID = omp_get_thread_num();
+        #pragma omp for schedule(static, 2) reduction(+ : k)
+        for(int i=0; i<10; ++i){
+            k += 2;
+            #pragma omp critical
+            {
+                std::cout <<"ID: " << ID << " k: " << k << std::endl;
+            }
+        }
+    }
+    std::cout << "k: " << k << std::endl;
+
+
+    // 对于第三种情况, 这时 k 是属于每个迭代步的, 各个线程之间互异, 同一线程不同迭代步之间也是互异的
+    // 这时再加 reduction(+ : k) 就没有什么作用了 reduction 是对共享变量的规约
+    double k = 2.0f;
+    omp_set_num_threads(3);
+    #pragma omp parallel
+    {
+        int ID = omp_get_thread_num();
+        #pragma omp for schedule(static, 2)
+        for(int i=0; i<10; ++i){
+            double k = 2.0f;
+            k += 2;
+            #pragma omp critical
+            {
+                std::cout <<"ID: " << ID << " k: " << k << std::endl;
+            }
+        }
+    }
+    std::cout << "k: " << k << std::endl;
+```
+### omp 中的变量
+* omp 通常将变量分成两种类型, 私有的和共享的 (这种私有和共享, 都是针对线程来说的)。默认情况下, 一个变量被声明在并行区域之外, 它是共享的; 如果一个变量被声明在并行区域之内, 那其就是私有的。可以通过以下几种方式来改变 (均是将共享变量私有化)
+* `private` 是声明变量属于每一个线程的, 但是初始值不固定。
+* `firstprivate` 是声明变量属于每一个线程, 其会将原始共享变量的初始值当作其初始值。
+* `lastprivate` 能够在 `private` 的基础上, 在循环结束时保留变量的值。
+* 所以 `firstprivate` 和 `lastprivate` 都不能与 `private` 一起使用。但是`firstprivate` 和 `lastprivate`可以一起使用。
+* 要注意共享静态数组和动态数据的私有化方式。对于静态数组来说, `firstprivate` 直接拷贝类型和数据给每个线程。但是对于动态数组来说, 必须指定要拷贝的范围, 然后给每个线程重新分配和拷贝。
+
 ## x86 SIMD 优化 [原文](https://www.cnblogs.com/moonzzz/p/17806496.html)
 * SIMD(Single Instruction, Multiple Data) 是一种并行计算技术, 通过向量寄存器存储多个数据元素, 并使用单条指令同时对这些数据元素进行处理, 从而提高计算效率。SIMD 其实是一种指令集的扩展, 如 `x86 平台的 SSE/AVX` 和 `ARM 平台的 NEON`。在 C++ 程序中使用 SIMD 指令的两种方式是 `内联汇编` 和 `intrinsic 函数`。`intrinsic 函数` 是对汇编指令的封装, 编译这些函数的时候会被内联成汇编, 不会产生函数调用的开销。完整的 `intrinsic 函数` 请查看 [文档](https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html)。
 * x86 目前主要的 SIMD 指令集有 `MMX`, `SSE`, `AVX`, `AVX-512`, 其处理的数据位宽为 `64位`, `128位`, `256位`, `512位`。每种位宽都对应一个数据类型, 名称包含 3 个部分。前缀 `__m`, 中间是数据位宽, 如 `64`, `128`, `256`, `512`, 类型 `i` 表示整数(int), `d` 表示双精度浮点型(double), `什么都不加` 表示单精度浮点型。
@@ -462,3 +660,42 @@ void sumArraySimd(float* A, float* B, float* C, int N)
 }
 ```
 ### 矩阵乘法优化
+```C++
+void matrixMul_normal(int **A, int **B, int **C, int M, int N, int K)
+{
+    for(int i=0; i<M; ++i)
+    {
+        for(int j=0; j<N; ++j)
+        {
+            for(int k=0; k<K; ++k)
+            {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
+```
+* 使用 `OpenMP` 优化矩阵乘法, 首先普通的矩阵乘法的写法如以上函数所示。这个是最朴素的写法, 但是有很多的问题。最内层的循环是对 `A矩阵` 的每一行和 `B矩阵` 的每一列进行逐元素的遍历, 然后对应元素相乘并且累加。这对于 `B矩阵` 的遍历方式是不友好的, 元素并不是连续访问。但是可以交换其中的遍历顺序, 将对 `B矩阵` 的列的遍历放到最内层遍历, 这样解决了跳跃元素访问的问题。
+* 其次利用 `AVX` 对连续内存访问和操作进行优化, 防止元素个数不够 `8` 整除的情况, 又再使用`将循环的索引取出到外边, 然后元素个数-8`的操作, 保证能够矢量化的元素个数足够, 而且又把边界条件完美解决。
+```C++
+void matrixMul_simd(int **A, int **B, int **C, int M, int N, int K){
+    #pragma omp parallel for num_threads(8)
+    for(int i=0; i<M; ++i)
+    {
+        for(int k=0; k<K; ++k)
+        {
+            int j = 0;
+            for(; j<=N-8; j+=8)
+            {
+                _mm256_store_si256((__m256i*)(C[i]+j), _mm256_add_epi32(_mm256_load_si256((__m256i*)(C[i]+j)),
+                                 _mm256_mullo_epi32(_mm256_set1_epi32(A[i][k]), _mm256_load_si256((__m256i*)(B[k]+j)))));
+            }
+
+            for(;j<N; ++j)
+            {
+                C[i][j] += A[i][k] * B[k][j];
+            }
+        }
+    }
+}
+```

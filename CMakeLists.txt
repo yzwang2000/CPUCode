@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # setting compiler flags 在 Debug 和 Release 下都会执行
 set(CMAKE_C_FLAGS    "${CMAKE_C_FLAGS}")
-set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -mavx2")
+set(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -mavx2 -fopenmp")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS}  \
                       -gencode=arch=compute_70,code=\\\"sm_70,compute_70\\\" \
                       -gencode=arch=compute_75,code=\\\"sm_75,compute_75\\\" \
@@ -55,5 +55,5 @@ link_directories(
   ${COMMON_LIB_DIRS}
 )
 
-add_executable(main element/element_v2.cpp)
+add_executable(main gemm/gemm_v2.cpp)
 target_link_libraries(main PUBLIC cublas)
